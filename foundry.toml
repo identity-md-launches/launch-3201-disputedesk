@@ -1,0 +1,16 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "test/scratch/out"
+cache_path = "test/scratch/cache"
+libs = ["lib"]
+solc = "0.8.26"
+offline = true
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+bytecode_hash = "none"
+evm_version = "cancun"
+
+[profile.default.fuzz]
+runs = 1024
