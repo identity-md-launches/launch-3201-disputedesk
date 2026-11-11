@@ -31,15 +31,18 @@ Every dial (owner only; every change emits an event):
   setBond: positive bond, at least oracleFee; payout arithmetic must fit uint256.
   setBountyMultiplier: nonnegative integer; bounty = bond * bountyMultiplier.
   setOracleFee: nonnegative, at most bond, paid from the filing's bond.
-  setRubric: nonzero sha256 and a nonempty UTF-8 URI, at most 500 bytes.
-  setRecordURI: nonempty UTF-8 URI, at most 500 bytes.
+  setRubric: nonzero sha256 and an absolute ASCII URI, at most 500 bytes.
+  setRecordURI: absolute ASCII URI, at most 500 bytes.
   setIntake: nonzero address other than this court; code is checked at filing.
   setPaused: blocks new filings only; unpausing requires both configured URIs.
 All terms, including both URIs, are snapshotted before any external call.
 The token and owner are immutable. Panel 5, quorum 3, 72-hour relative window,
 604800-second validity and rejection cooldown, and 3 open filings per address
-are constants. URI bounds keep the decoded question below 2000 bytes. JSON text
-is UTF-8 validated and escaped. evidenceHash is sha256, or zero for "unpinned".
+are constants. Callbacks accept stronger panels, requiring agreement at least
+their signed quorum. All URI inputs require a scheme and RFC 3986 characters;
+spaces, controls, double quotes, backslashes and raw non-ASCII bytes are rejected.
+Use percent encoding for such URI bytes. URI bounds keep the decoded question below
+2000 bytes. JSON text is escaped. evidenceHash is sha256, or zero for "unpinned".
 
 Money flow for the initial terms, in IMD:
   Filing: pull 1 from challenger; Intake takes 0.5; escrow retains 0.5.
@@ -56,8 +59,10 @@ reservedBounties <= poolBalance. Reservations include the oracle-fee refund.
 Oracle integration and trust:
 The callback uses the protocol's complete 15-field attestation, in the court's
 EIP-712 domain (IdentityMD Oracle, version 2), and verifies the supplied network
-signer 0x5598aa9146215bc13eb26f2c692ad1461fd32982. ERC-1271 is supported if that
-address has code. The signer is fixed: there is no owner verdict-signing power.
+signer 0x5598aa9146215bc13eb26f2c692ad1461fd32982. ECDSA is checked first, including
+when the signer has EIP-7702 delegated code; ERC-1271 is the fallback for code at
+that address. The signer is fixed: there is no owner verdict-signing power or
+signer rotation path. A protocol signer change therefore requires a new court.
 Only the ORIGINAL intake can answer an existing, Open request. The intake id and
 oracle UUID differ; both are protected against reuse. The required relative
 window is resolved off chain, so pairing questionHash with the intake request
@@ -111,7 +116,7 @@ Review notes:
     exactly; approvals are limited to one fee and cleared before filing returns.
   - Time comparisons implement the required cooldown and signed validity window;
     the oracle timestamp tolerance is 300 seconds, matching the pinned protocol.
-  - UTF-8 and JSON loops have fixed input bounds; no loop scans stored challenges.
+  - URI and JSON loops have fixed input bounds; no loop scans stored challenges.
   - Protocol scope: the brief's relative window, automatic failure refunds and
     no-cancellation rule intentionally differ from the generic consumer example.
     The liveness and request-pairing assumptions are documented above.
@@ -410,7 +415,7 @@ contract DisputeDesk {
         Challenge storage c = _openRequest(requestId);
         if (
             a.chainId != 1 || a.answerType != 0 || a.answer.length != 32 || a.requestId == bytes32(0)
-                || a.panelSize != PANEL_SIZE || a.quorum != QUORUM || a.agreed < QUORUM || a.agreed > PANEL_SIZE
+                || a.panelSize < PANEL_SIZE || a.quorum < QUORUM || a.agreed < a.quorum || a.agreed > a.panelSize
                 || a.fromBlock > a.toBlock || a.expiresAt < a.issuedAt || block.timestamp > a.expiresAt
                 || a.issuedAt > block.timestamp + ISSUED_AT_TOLERANCE
                 || uint256(a.issuedAt) + ISSUED_AT_TOLERANCE < c.filedAt
@@ -548,28 +553,29 @@ contract DisputeDesk {
     }
 
     function _verifySignature(bytes32 digest, bytes calldata signature) private view {
+        // An EOA may have EIP-7702 delegated code without supporting ERC-1271.
+        // As in the protocol's SignatureChecker, try canonical ECDSA first.
+        if (signature.length == 65) {
+            bytes32 r;
+            bytes32 s;
+            uint8 v;
+            assembly ("memory-safe") {
+                r := calldataload(signature.offset)
+                s := calldataload(add(signature.offset, 32))
+                v := byte(0, calldataload(add(signature.offset, 64)))
+            }
+            // EIP-2 low-s; canonical Ethereum 27/28 recovery ids.
+            if (
+                uint256(s) <= 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0 && (v == 27 || v == 28)
+                    && ecrecover(digest, v, r, s) == oracleSigner
+            ) return;
+        }
         if (oracleSigner.code.length != 0) {
             (bool ok, bytes memory result) =
                 oracleSigner.staticcall(abi.encodeWithSelector(bytes4(0x1626ba7e), digest, signature));
-            if (!ok || result.length < 32 || abi.decode(result, (bytes32)) != bytes32(bytes4(0x1626ba7e))) {
-                revert BadSignature();
-            }
-            return;
+            if (ok && result.length >= 32 && abi.decode(result, (bytes32)) == bytes32(bytes4(0x1626ba7e))) return;
         }
-        if (signature.length != 65) revert BadSignature();
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-        assembly ("memory-safe") {
-            r := calldataload(signature.offset)
-            s := calldataload(add(signature.offset, 32))
-            v := byte(0, calldataload(add(signature.offset, 64)))
-        }
-        // EIP-2 low-s; canonical Ethereum 27/28 recovery ids.
-        if (
-            uint256(s) > 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0 || (v != 27 && v != 28)
-                || ecrecover(digest, v, r, s) != oracleSigner
-        ) revert BadSignature();
+        revert BadSignature();
     }
 
     function _requestBody(Challenge memory c) private view returns (bytes memory) {
@@ -616,33 +622,39 @@ contract DisputeDesk {
         return string(out);
     }
 
-    /// @dev Bounded UTF-8 validation: reject overlong encodings, surrogates, incomplete
-    ///      sequences and code points above U+10FFFF. ASCII controls are JSON-escaped.
+    /// @dev Bound every URI slot to an absolute scheme and RFC 3986 characters, so
+    ///      raw prose cannot be spliced into the fixed question. Percent escapes
+    ///      stay encoded; no whitespace, controls, double quotes, backslashes or raw UTF-8.
     function _validateURI(bytes memory raw) private pure {
-        if (raw.length == 0 || raw.length > MAX_URI_BYTES) revert InvalidURI();
-        for (uint256 i; i < raw.length;) {
+        if (raw.length < 2 || raw.length > MAX_URI_BYTES) revert InvalidURI();
+        uint8 first = uint8(raw[0]);
+        if (!((first >= 0x41 && first <= 0x5a) || (first >= 0x61 && first <= 0x7a))) revert InvalidURI();
+        bool hasScheme = false;
+        for (uint256 i = 1; i < raw.length; ++i) {
             uint8 c = uint8(raw[i]);
-            if (c < 0x80) {
-                ++i;
-                continue;
+            bool alphanumeric = (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39);
+            if (!hasScheme) {
+                if (c == 0x3a) hasScheme = true; // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+                else if (!alphanumeric && c != 0x2b && c != 0x2d && c != 0x2e) revert InvalidURI();
+            } else if (c == 0x25) {
+                if (i + 2 >= raw.length) revert InvalidURI();
+                for (uint256 j = 1; j <= 2; ++j) {
+                    uint8 digit = uint8(raw[i + j]);
+                    if (!((digit >= 0x30 && digit <= 0x39) || (digit >= 0x41 && digit <= 0x46)
+                                || (digit >= 0x61 && digit <= 0x66))) revert InvalidURI();
+                }
+                i += 2;
+            } else if (
+                // unreserved / gen-delims / sub-delims; '%' is handled above.
+                !alphanumeric && c != 0x2d && c != 0x2e && c != 0x5f && c != 0x7e && c != 0x3a && c != 0x2f && c != 0x3f
+                    && c != 0x23 && c != 0x5b && c != 0x5d && c != 0x40 && c != 0x21 && c != 0x24 && c != 0x26
+                    && c != 0x27 && c != 0x28 && c != 0x29 && c != 0x2a && c != 0x2b && c != 0x2c && c != 0x3b
+                    && c != 0x3d
+            ) {
+                revert InvalidURI();
             }
-            uint256 n;
-            if (c >= 0xc2 && c <= 0xdf) n = 2;
-            else if (c >= 0xe0 && c <= 0xef) n = 3;
-            else if (c >= 0xf0 && c <= 0xf4) n = 4;
-            else revert InvalidURI();
-            if (i + n > raw.length) revert InvalidURI();
-            uint8 second = uint8(raw[i + 1]);
-            if (
-                (c == 0xe0 && second < 0xa0) || (c == 0xed && second >= 0xa0) || (c == 0xf0 && second < 0x90)
-                    || (c == 0xf4 && second >= 0x90)
-            ) revert InvalidURI();
-            for (uint256 j = 1; j < n; ++j) {
-                uint8 next = uint8(raw[i + j]);
-                if (next < 0x80 || next > 0xbf) revert InvalidURI();
-            }
-            i += n;
         }
+        if (!hasScheme) revert InvalidURI();
     }
 
     /// @dev The validated question has at most 497 + 3 * MAX_URI_BYTES = 1997 bytes.

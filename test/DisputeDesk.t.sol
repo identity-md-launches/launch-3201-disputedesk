@@ -290,7 +290,8 @@ contract MockIntake is IIntake {
 /// @dev The production signer is fixed. Unit tests install an ERC-1271 verifier at
 /// that address, verifying real ECDSA signatures from the published protocol test
 /// key. It does NOT accept arbitrary signatures. A separate vector pins the real
-/// protocol digest; EOA rejection paths run with this mock removed.
+/// protocol digest; dedicated EOA tests remove this mock and substitute only the
+/// runtime signer constant to exercise production ECDSA acceptance.
 contract DeskTestSigner {
     address private immutable signer;
 
@@ -1850,7 +1851,7 @@ contract DisputeDeskOracleTest is DeskFixture {
         assertEq(desk.challenges(id).evidenceHash, bytes32(0), "optional pin stored");
     }
 
-    function test_jsonEscapesEveryControlQuoteBackslashAndPreservesUTF8() public {
+    function test_jsonPreservesPercentEncodedTextAndRejectsRawInjection() public {
         bytes memory controls = new bytes(32);
         for (uint256 i; i < 32; ++i) {
             controls[i] = bytes1(uint8(i));
@@ -1862,6 +1863,23 @@ contract DisputeDeskOracleTest is DeskFixture {
         );
         string memory rubricURI_ = 'https://rubric.example/"\\\n\r\t';
         string memory record = string(bytes.concat(bytes('https://record.example/"\\'), hex"080c"));
+        // URI validation rejects raw prose/JSON delimiters before spending a fee.
+        // The same bytes may be carried safely in a percent-encoded path.
+        vm.expectRevert(DisputeDesk.InvalidURI.selector);
+        vm.prank(alice);
+        desk.challenge(edition, claim, uri, evidence);
+        vm.expectRevert(DisputeDesk.InvalidURI.selector);
+        vm.prank(NEWSROOM);
+        desk.setRubric(RUBRIC, rubricURI_);
+        vm.expectRevert(DisputeDesk.InvalidURI.selector);
+        vm.prank(NEWSROOM);
+        desk.setRecordURI(record);
+        _assertPristineFiling();
+        assertEq(desk.rubricURI(), RUBRIC_URI, "raw rubric injection persisted");
+        assertEq(desk.recordURI(), RECORD_URI, "raw record injection persisted");
+        uri = string.concat("https://evidence.example/", _percentEncode(bytes(uri)));
+        rubricURI_ = string.concat("https://rubric.example/", _percentEncode(bytes(rubricURI_)));
+        record = string.concat("https://record.example/", _percentEncode(bytes(record)));
         vm.startPrank(NEWSROOM);
         desk.setRubric(RUBRIC, rubricURI_);
         desk.setRecordURI(record);
@@ -1873,27 +1891,40 @@ contract DisputeDeskOracleTest is DeskFixture {
     }
 
     /// forge-config: default.fuzz.runs = 256
-    function testFuzz_jsonRoundTripForBoundedASCIIAndArbitraryHashes(
+    function testFuzz_jsonRoundTripForPercentEncodedURIsAndArbitraryHashes(
         bytes memory seed,
         bytes32 ed,
         bytes32 cl,
         bytes32 pin
     ) public {
-        uint256 length = seed.length == 0 ? 1 : (seed.length > 500 ? 500 : seed.length);
+        // Each arbitrary byte needs three URI characters; leave room for the scheme/host.
+        uint256 length = seed.length > 150 ? 150 : seed.length;
         bytes memory uriBytes = new bytes(length);
         for (uint256 i; i < length; ++i) {
-            uriBytes[i] = seed.length == 0 ? bytes1("x") : bytes1(uint8(seed[i]) & 0x7f);
+            uriBytes[i] = seed[i];
         }
-        string memory uri = string(uriBytes);
+        string memory uri = string.concat("https://evidence.example/", _percentEncode(uriBytes));
         vm.prank(alice);
         bytes32 id = desk.challenge(ed, cl, uri, pin);
         _assertBody(id, _question(ed, cl, uri, RUBRIC_URI, RUBRIC, RECORD_URI), pin);
     }
 
-    function test_maximumLengthURIsKeepQuestionAndEscapedBodyWithinOracleLimits() public {
-        bytes memory raw = new bytes(500);
+    function _percentEncode(bytes memory raw) private pure returns (string memory) {
+        bytes16 digits = "0123456789ABCDEF";
+        bytes memory encoded = new bytes(raw.length * 3);
         for (uint256 i; i < raw.length; ++i) {
-            raw[i] = bytes1(uint8(1));
+            encoded[3 * i] = "%";
+            encoded[3 * i + 1] = digits[uint8(raw[i]) >> 4];
+            encoded[3 * i + 2] = digits[uint8(raw[i]) & 15];
+        }
+        return string(encoded);
+    }
+
+    function test_maximumLengthURIsKeepQuestionAndBodyWithinOracleLimits() public {
+        bytes memory raw = new bytes(500);
+        bytes memory prefix = bytes("https://evidence.example/");
+        for (uint256 i; i < raw.length; ++i) {
+            raw[i] = i < prefix.length ? prefix[i] : bytes1("a");
         }
         string memory uri = string(raw);
         vm.startPrank(NEWSROOM);
@@ -2095,6 +2126,78 @@ contract DisputeDeskOracleTest is DeskFixture {
         intake.deliver(id, a, "");
         _accounting(INITIAL_POOL, 15e17, 5e17);
         _verdict(id, true);
+    }
+
+    function test_EOASignerAcceptsValidUpheldVerdict() public {
+        _assertEOASettlement(true);
+    }
+
+    function test_EOASignerAcceptsValidRejectedVerdict() public {
+        _assertEOASettlement(false);
+    }
+
+    function _assertEOASettlement(bool upheld) private {
+        _useEOASigner();
+        bytes32 id = _file(alice, claim);
+        OracleAttestation.Attestation memory a = _attestation(id, upheld);
+        bytes memory signature = _signature(a);
+        assertEq(signature.length, 65, "canonical ECDSA signature length");
+
+        // A changed answer must still fail: replacing the trusted address must
+        // not bypass verification or let the ERC-1271 fixture accept the result.
+        a.answer = abi.encode(!upheld);
+        vm.expectRevert(DisputeDesk.BadSignature.selector);
+        intake.deliver(id, a, signature);
+        assertTrue(!desk.consumed(a.requestId), "tampered ECDSA verdict consumed UUID");
+        _accounting(INITIAL_POOL, 15e17, 5e17);
+
+        a.answer = abi.encode(upheld);
+        // MockIntake uses the recorded callback selector and a 200,000-gas cap.
+        intake.deliver(id, a, signature);
+        _closed(id, upheld ? DisputeDesk.Status.Upheld : DisputeDesk.Status.Rejected);
+        assertTrue(desk.consumed(a.requestId), "ECDSA verdict did not consume UUID");
+        _accounting(upheld ? 3e18 : INITIAL_POOL, 0, 0);
+        assertEq(token.balanceOf(alice), upheld ? INITIAL_USER + 1e18 : INITIAL_USER - 1e18, "EOA challenger payout");
+        assertEq(token.balanceOf(NEWSROOM), upheld ? 0 : 5e17, "EOA owner payout");
+        assertEq(token.balanceOf(address(intake)), 5e17, "EOA oracle fee remains spent");
+        assertEq(desk.cooldownUntil(claim), upheld ? 0 : block.timestamp + 604800, "EOA verdict cooldown");
+        vm.expectRevert(DisputeDesk.NotOpen.selector);
+        intake.deliver(id, a, signature);
+    }
+
+    function _useEOASigner() private {
+        // The mainnet signer's private key is unavailable. Change only PUSH20
+        // operands equal to its constant in this test instance's runtime. All
+        // opcodes, storage, immutables and signature checks remain as compiled.
+        // No precompile is mocked and neither signer address has ERC-1271 code.
+        address originalSigner = desk.oracleSigner();
+        address testSigner = vm.addr(SIGNER_KEY);
+        vm.etch(originalSigner, "");
+        assertEq(originalSigner.code.length, 0, "ERC-1271 fixture must be removed");
+        assertEq(testSigner.code.length, 0, "test signer must be an EOA");
+        bytes memory runtime = address(desk).code;
+        uint256 replacements;
+        for (uint256 offset; offset < runtime.length; ++offset) {
+            uint8 opcode = uint8(runtime[offset]);
+            if (opcode < 0x60 || opcode > 0x7f) continue;
+            uint256 width = opcode - 0x5f;
+            if (width == 20 && offset + width < runtime.length) {
+                bytes20 operand;
+                assembly ("memory-safe") {
+                    operand := mload(add(add(runtime, 33), offset))
+                }
+                if (operand == bytes20(originalSigner)) {
+                    for (uint256 j; j < 20; ++j) {
+                        runtime[offset + 1 + j] = bytes20(testSigner)[j];
+                    }
+                    ++replacements;
+                }
+            }
+            offset += width; // Skip PUSH data so it cannot be mistaken for opcodes.
+        }
+        assertTrue(replacements > 0, "no signer PUSH20 found in runtime");
+        vm.etch(address(desk), runtime);
+        assertEq(desk.oracleSigner(), testSigner, "signer substitution failed");
     }
 
     function test_realEOASignerRejectsWrongKeyLengthHighSAndInvalidV() public {
