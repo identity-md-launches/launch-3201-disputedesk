@@ -1,0 +1,18 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "DisputeDesk",
+      "constructorArgs": [
+        "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+        "0xa43e6f75ee006411f79ac1c84120606c2330de82",
+        "$owner",
+        "1000000000000000000",
+        "1",
+        "500000000000000000",
+        "0x494c69552db9fd948e2f4bce26da4d0b3e08d2e5b1cdfbade546af42e677b0b9"
+      ]
+    }
+  ],
+  "notes": "DisputeDesk v1, the Open Interest dispute court on Ethereum mainnet (chain 1): trial period - verdicts bind from day one. Deploy only DisputeDesk from src/DisputeDesk.sol. $owner resolves to the newsroom wallet 0xbe80e5979313cf8aff2b8e54e615fe3ecd8358f5. The contract starts paused with empty rubricURI and recordURI. After deployment, the newsroom calls setRubric with the constructor rubric hash and https://openinterest-ai.github.io/paper/rubric.txt, sets recordURI to https://openinterest-ai.github.io/paper/, approves the court on IMD, funds the pool via fundPool(4500000000000000000), and unpauses. These are subsequent newsroom actions, not launch initialization calls. Initial terms are a 1000000000000000000 bond, bounty multiplier 1, and 500000000000000000 oracle fee. Each filing locks its terms and intake. Upheld pays bond plus bounty; rejected pays the escrow remainder to the newsroom; failure refunds the remainder to the challenger. The pool has no withdrawal path."
+}
